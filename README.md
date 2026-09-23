@@ -4,7 +4,7 @@ Laboratório educacional de Backend, DevOps e Cloud Computing em Go. Simulará o
 
 ## Etapa atual
 
-Fase 1, segundo passo: um servidor HTTP local com `GET /health` e `GET /customers`, que retorna um cliente fictício fixo. Sem dependências externas ou recursos cloud. Cadastro de clientes, contas e operações financeiras serão adicionados progressivamente, após validação do aprendizado.
+Fase 1, terceiro passo: servidor HTTP local com `GET /health`, `GET /customers` e `POST /customers`. Os clientes ficam em memória, começando com um cliente fictício. Sem dependências externas ou recursos cloud. Contas e operações financeiras serão adicionadas progressivamente, após validação do aprendizado.
 
 ## Pré-requisitos e execução
 
@@ -36,7 +36,8 @@ Uma API é um contrato de comunicação entre programas. REST é um estilo arqui
 | Arquivo | Função |
 | --- | --- |
 | `go.mod` | Nome do módulo (`nimbusbank`) e versão de Go; não temos dependências externas |
-| `main.go` | Entrada do programa, configuração da rota e handler |
+| `main.go` | Entrada do programa, rotas, handlers e clientes em memória |
+| `main_test.go` | Testes de cadastro, validação e concorrência |
 | `.gitignore` | Evita versionar arquivos de ambiente, binários e arquivos locais do macOS |
 
 Leia `main.go` nesta ordem:
@@ -88,11 +89,11 @@ go vet ./...
 go build -o bin/nimbusbank .
 ```
 
-`gofmt -l` não deve listar arquivos; `go vet` procura problemas comuns; `go build` gera um executável em `bin/`, ignorado pelo Git. A validação HTTP é manual neste passo. Ainda não há testes automatizados; `go test ./...` informará isso.
+`gofmt -l` não deve listar arquivos; `go vet` procura problemas comuns; `go build` gera um executável em `bin/`, ignorado pelo Git. Além da validação manual, execute `go test ./...` para os testes automatizados e `go test -race ./...` para detectar acessos concorrentes sem sincronização durante os testes.
 
 ## Segundo passo: listagem de clientes
 
-`GET /customers` responde `200 OK` e um array JSON com um cliente fictício:
+`GET /customers` responde `200 OK` e um array JSON. Logo após iniciar o programa, há um cliente fictício:
 
 ```sh
 curl -i http://localhost:8080/customers
@@ -107,26 +108,81 @@ Se o servidor já estava rodando antes da alteração, encerre com `Ctrl+C` e ex
 Leia as novas partes de `main.go`:
 
 1. `type Customer struct` define um tipo nomeado. Cada cliente tem `ID` inteiro e `Name` e `Email` do tipo string. As tags definem os nomes dos campos no JSON.
-2. `[]Customer` é um slice: uma sequência de valores do tipo `Customer`. O literal dentro das chaves cria nossa lista com um elemento.
-3. `listCustomersHandler` cria os dados fictícios a cada requisição. Ainda não há cadastro nem armazenamento compartilhado.
+2. `[]Customer` é um slice: uma sequência de valores do tipo `Customer`. O literal dentro das chaves inicializa nossa lista compartilhada com um elemento.
+3. `listCustomersHandler` copia a lista sob proteção de um mutex antes de produzir a resposta. Assim, também retorna os clientes cadastrados durante esta execução.
 4. O encoder transforma o slice em um array JSON (`[...]`) e cada struct em um objeto (`{...}`).
 5. `mux.HandleFunc("GET /customers", listCustomersHandler)` conecta a rota ao handler.
 
-Dados fixos ajudam a estudar o contrato da API. Uma coleção mutável permitiria cadastrar clientes, mas exigiria proteger leituras e escritas concorrentes; isso será tratado no passo de cadastro. Persistência em PostgreSQL virá na Fase 3.
+No segundo passo usamos dados fixos para estudar o contrato da API. Agora a coleção é mutável e o mutex protege leituras e escritas concorrentes. Persistência em PostgreSQL virá na Fase 3.
 
-Para experimentar uma coleção vazia, substitua temporariamente o literal por `customers := []Customer{}`, reinicie o servidor e consulte a rota: a resposta será `[]`. Já `var customers []Customer` declara um slice nil, que o encoder representa como `null`. Depois restaure o exemplo com o cliente. Essa distinção importa para consumidores que esperam sempre um array.
+Para experimentar uma coleção vazia, substitua temporariamente a inicialização da variável global por `customers = []Customer{}`, reinicie o servidor e consulte a rota: a resposta será `[]`. Um slice nil seria representado diretamente pelo encoder como `null`; nosso handler usa `make` para que a cópia vazia seja sempre representada como `[]`. Depois restaure o exemplo com o cliente. Essa distinção importa para consumidores que esperam sempre um array.
 
 Verifique também:
 
 ```sh
-curl -i -X POST http://localhost:8080/customers
+curl -i -X DELETE http://localhost:8080/customers
 curl -I http://localhost:8080/customers
 curl -i http://localhost:8080/health
 ```
 
-Resultados esperados: `405` (cadastro ainda não implementado), `200` sem corpo e o health check original com `200` e `{"status":"ok"}`.
+Resultados esperados: `405` (exclusão ainda não implementada), `200` sem corpo e o health check original com `200` e `{"status":"ok"}`.
 
 Em uma entrevista, explique como uma struct representa um registro, como um slice representa uma coleção e por que os nomes exportados em Go podem ser diferentes dos nomes no JSON. Em uma API profissional, o mesmo contrato de listagem pode ser alimentado por consultas ao banco.
+
+## Terceiro passo: cadastro em memória
+
+Reinicie o servidor após alterar o código (`Ctrl+C`, depois `go run .`). Em outro terminal:
+
+```sh
+curl -i -X POST http://localhost:8080/customers \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Bruno Lima","email":"bruno@example.com"}'
+```
+
+`-X POST` escolhe o método, `-H` declara o formato do corpo e `-d` envia os dados. Esperado no primeiro cadastro após iniciar o servidor:
+
+```text
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"id":2,"name":"Bruno Lima","email":"bruno@example.com"}
+```
+
+Consulte `GET /customers` novamente: a lista deve conter Ana e Bruno. Cada POST válido cria um novo cliente e recebe outro ID; não verificamos duplicidade de e-mail neste passo. Ao reiniciar, os cadastros são perdidos e o contador volta a 2.
+
+Como o cadastro funciona:
+
+1. Uma struct de entrada contém somente `Name` e `Email`. O ID pertence à resposta e é gerado pelo servidor.
+2. `json.NewDecoder(r.Body).Decode(&input)` lê JSON do corpo e preenche a struct. `&input` fornece o endereço da variável para que o decoder possa modificá-la.
+3. `DisallowUnknownFields` rejeita campos desconhecidos, inclusive `id`. Uma segunda leitura deve encontrar `io.EOF` (fim da entrada); isso rejeita dois objetos ou conteúdo extra no mesmo corpo.
+4. `strings.TrimSpace` remove espaços nas extremidades. Campos ausentes, vazios ou contendo apenas espaços são rejeitados. Ainda não validamos formato nem unicidade do e-mail.
+5. `customersMu.Lock()` protege a geração do ID, o `append` na lista e o incremento do contador como uma única seção crítica. `Unlock()` libera o acesso para outra requisição.
+6. `WriteHeader(http.StatusCreated)` envia explicitamente `201` antes do corpo JSON. Erros de entrada usam `http.Error`, com status `400` e mensagem em texto simples.
+
+O GET copia a lista enquanto mantém o mutex e libera a trava antes de escrever pela rede. Isso mantém uma visão consistente dos clientes sem bloquear cadastros enquanto um consumidor recebe sua resposta. As variáveis globais mantêm este exercício pequeno; isolamento do estado e separação de responsabilidades serão abordados na Fase 2.
+
+Teste uma entrada inválida:
+
+```sh
+curl -i -X POST http://localhost:8080/customers \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"   ","email":"bruno@example.com"}'
+```
+
+Esperado: `400 Bad Request`. Consulte a lista e confirme que nada foi adicionado. JSON quebrado, corpo vazio e campos desconhecidos também devem retornar `400`.
+
+Execute os testes:
+
+```sh
+go test -v ./...
+go test -race ./...
+```
+
+`main_test.go` usa `httptest` para enviar requisições diretamente aos handlers e inspecionar as respostas, sem ocupar a porta 8080. Verifica cadastro seguido de consulta, limpeza de espaços, entradas inválidas sem alteração de estado e 20 cadastros concorrentes intercalados com consultas. O detector `-race` procura acessos à memória sem sincronização nos caminhos executados; não é uma prova de ausência de todos os problemas de concorrência.
+
+Profissionalmente, validação protege o contrato da API, e sincronização protege dados compartilhados. O mutex coordena apenas este processo: ele não substitui transações no banco nem coordena várias instâncias da API.
+
+Perguntas de entrevista: por que usamos `201` no cadastro e `200` na consulta? O que poderia acontecer se duas requisições lessem o mesmo próximo ID sem trava? Por que dados em memória desaparecem quando o processo termina?
 
 ## Uso profissional e entrevista
 
